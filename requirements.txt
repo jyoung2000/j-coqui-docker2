@@ -1,0 +1,35 @@
+# Core TTS
+TTS
+
+# Web framework
+fastapi
+uvicorn
+gradio
+
+# Audio processing dependencies
+librosa
+soundfile
+scipy
+pydub
+noisereduce
+pyloudnorm
+
+# Basic utilities
+numpy
+pandas
+requests
+python-dotenv 
+
+# Additional dependencies for audio processing
+resemblyzer
+umap-learn
+visdom
+phonemizer
+jieba
+pypinyin
+mecab-python3
+unidic-lite
+
+# System audio dependencies
+pyaudio
+portaudio19-dev
