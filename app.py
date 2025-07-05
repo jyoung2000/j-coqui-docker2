@@ -1,26 +1,27 @@
+#!/usr/bin/env python3
+
+"""
+Coqui TTS Web Interface with Advanced Voice Cloning
+A comprehensive web application for text-to-speech synthesis and voice cloning
+"""
+
 import os
 import sys
-import asyncio
-import json
 import logging
+import asyncio
+import uuid
 import shutil
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-from datetime import datetime
-import uuid
-
+import uvicorn
 import gradio as gr
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form, BackgroundTasks
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-import uvicorn
-import torch
-from TTS.api import TTS
 
-# Add modules to path
-sys.path.append(str(Path(__file__).parent))
+# Add current directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent))
 
 # Import custom modules
 from modules.tts_handler import TTSHandler
@@ -28,29 +29,28 @@ from modules.voice_cloner import VoiceCloner
 from modules.voice_cloner_advanced import AdvancedVoiceCloner
 from modules.model_manager import ModelManager
 from modules.audio_processor import AudioProcessor
-from modules.webgui import create_gradio_interface
-from modules.api_handler import APIHandler
 from modules.database_handler import DatabaseHandler
+from modules.api_handler import APIHandler
+from modules.webgui import create_gradio_interface
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('/app/logs/app.log'),
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(
     title="Coqui TTS WebGUI",
+    description="Advanced Text-to-Speech and Voice Cloning Web Interface",
     version="2.0.0",
-    description="Advanced TTS Web Interface with Voice Cloning and Comprehensive API"
+    docs_url="/api/docs",
+    redoc_url="/api/redoc"
 )
 
-# Add CORS middleware
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -59,25 +59,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize handlers
+# Initialize components
+logger.info("Initializing TTS components...")
 tts_handler = TTSHandler()
 voice_cloner = VoiceCloner()
 advanced_voice_cloner = AdvancedVoiceCloner()
 model_manager = ModelManager()
 audio_processor = AudioProcessor()
-api_handler = APIHandler()
 db_handler = DatabaseHandler()
+api_handler = APIHandler()
 
-# Mount static files
-static_dir = Path(__file__).parent / "static"
-if static_dir.exists():
-    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
-
-# Create downloads directory
-downloads_dir = Path(__file__).parent / "static" / "downloads"
+# Create directories
+downloads_dir = Path("/app/static/downloads")
 downloads_dir.mkdir(exist_ok=True, parents=True)
 
-# Pydantic models for API
+# Pydantic models for API requests
 class TTSRequest(BaseModel):
     text: str = Field(..., description="Text to synthesize")
     model_name: Optional[str] = Field(None, description="TTS model name")
@@ -104,25 +100,34 @@ class ModelDownloadRequest(BaseModel):
 # Health check endpoint
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "service": "coqui-tts-webgui",
-        "version": "2.0.0",
-        "cuda_available": torch.cuda.is_available(),
-        "models_loaded": len(model_manager.loaded_models)
-    }
+    """Health check endpoint for container monitoring"""
+    try:
+        # Basic component checks
+        models_available = len(model_manager.list_models()) > 0
+        
+        return {
+            "status": "healthy",
+            "components": {
+                "tts_handler": "ok",
+                "voice_cloner": "ok",
+                "model_manager": "ok",
+                "audio_processor": "ok",
+                "models_available": models_available
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Health check failed: {str(e)}")
 
-# API routes
+# TTS API endpoints
 @app.post("/api/tts")
 async def text_to_speech(request: TTSRequest, background_tasks: BackgroundTasks):
-    """Generate speech from text with advanced options"""
+    """Generate speech from text"""
     try:
-        # Generate unique ID for this request
-        request_id = str(uuid.uuid4())
+        # Validate API access
+        api_handler.validate_request()
         
-        # Log request
-        logger.info(f"TTS request {request_id}: {request.text[:50]}...")
+        # Generate unique request ID
+        request_id = str(uuid.uuid4())
         
         # Synthesize speech
         audio_path = await tts_handler.synthesize(
@@ -134,59 +139,60 @@ async def text_to_speech(request: TTSRequest, background_tasks: BackgroundTasks)
             pitch=request.pitch,
             energy=request.energy,
             emotion=request.emotion,
-            output_format=request.output_format,
-            stream=request.stream
-        )
-        
-        # Save to database
-        db_handler.save_synthesis(
-            request_id=request_id,
-            text=request.text,
-            audio_path=str(audio_path),
-            settings=request.dict()
+            output_format=request.output_format
         )
         
         # Create download link
         download_path = downloads_dir / f"{request_id}.{request.output_format}"
         shutil.copy(audio_path, download_path)
         
+        # Log synthesis
+        db_handler.log_synthesis(
+            request_id=request_id,
+            text=request.text,
+            model_name=request.model_name,
+            speaker=request.speaker,
+            language=request.language
+        )
+        
         return {
             "success": True,
             "request_id": request_id,
-            "audio_path": str(audio_path),
             "download_url": f"/api/download/{request_id}",
-            "duration": audio_processor.get_duration(audio_path)
+            "audio_duration": tts_handler.get_duration(audio_path),
+            "model_used": request.model_name or "default"
         }
     except Exception as e:
-        logger.error(f"TTS error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/download/{request_id}")
 async def download_audio(request_id: str):
-    """Download synthesized audio"""
+    """Download synthesized audio file"""
     try:
-        # Find the audio file
-        files = list(downloads_dir.glob(f"{request_id}.*"))
-        if not files:
-            raise HTTPException(status_code=404, detail="Audio file not found")
+        # Find file with any supported extension
+        for ext in ["wav", "mp3", "ogg", "flac"]:
+            file_path = downloads_dir / f"{request_id}.{ext}"
+            if file_path.exists():
+                return FileResponse(
+                    path=str(file_path),
+                    media_type=f"audio/{ext}",
+                    filename=f"tts_output_{request_id}.{ext}"
+                )
         
-        return FileResponse(
-            files[0],
-            media_type="audio/wav",
-            filename=f"tts_{request_id}.{files[0].suffix}"
-        )
+        raise HTTPException(status_code=404, detail="Audio file not found")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# Model management endpoints
 @app.get("/api/models")
 async def list_models():
-    """List all available TTS models with details"""
+    """List all available TTS models"""
     try:
-        models = model_manager.list_all_models()
+        models = model_manager.list_models()
         return {
             "success": True,
             "models": models,
-            "total": len(models)
+            "total_models": len(models)
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -195,11 +201,11 @@ async def list_models():
 async def download_model(request: ModelDownloadRequest, background_tasks: BackgroundTasks):
     """Download a new TTS model"""
     try:
-        # Start download in background
+        # Add download task to background
         background_tasks.add_task(
             model_manager.download_model,
-            request.model_name,
-            request.model_type
+            model_name=request.model_name,
+            model_type=request.model_type
         )
         
         return {
@@ -220,8 +226,9 @@ async def get_model_info(model_name: str):
             "model_info": model_info
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=404, detail=f"Model {model_name} not found")
 
+# Voice cloning endpoints
 @app.post("/api/voices/clone")
 async def clone_voice(
     name: str = Form(...),
@@ -233,44 +240,41 @@ async def clone_voice(
     """Clone a voice from uploaded audio"""
     try:
         # Save uploaded file
-        upload_dir = Path("/app/temp/uploads")
-        upload_dir.mkdir(exist_ok=True, parents=True)
-        
-        file_path = upload_dir / f"{uuid.uuid4()}.wav"
-        with open(file_path, "wb") as f:
-            f.write(await audio_file.read())
+        temp_path = Path(f"/app/temp/{audio_file.filename}")
+        with open(temp_path, "wb") as f:
+            content = await audio_file.read()
+            f.write(content)
         
         # Clone voice
         voice_id = await voice_cloner.clone_voice(
+            audio_path=str(temp_path),
             name=name,
             description=description,
-            audio_path=str(file_path),
             quality=quality,
             denoise=denoise
         )
         
-        # Clean up temp file
-        file_path.unlink()
+        # Clean up
+        temp_path.unlink()
         
         return {
             "success": True,
             "voice_id": voice_id,
-            "name": name,
-            "message": "Voice cloned successfully"
+            "voice_name": name,
+            "message": f"Voice '{name}' cloned successfully"
         }
     except Exception as e:
-        logger.error(f"Voice cloning error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/voices")
 async def list_voices():
-    """List all available voices"""
+    """List all cloned voices"""
     try:
         voices = voice_cloner.list_voices()
         return {
             "success": True,
             "voices": voices,
-            "total": len(voices)
+            "total_voices": len(voices)
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -282,7 +286,7 @@ async def delete_voice(voice_id: str):
         success = voice_cloner.delete_voice(voice_id)
         return {
             "success": success,
-            "message": "Voice deleted successfully" if success else "Voice not found"
+            "message": f"Voice {voice_id} deleted" if success else "Voice not found"
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -293,47 +297,37 @@ async def batch_clone_voices(
     base_name: str = Form(...),
     quality: int = Form(7)
 ):
-    """Clone multiple voices from uploaded audio files"""
+    """Clone multiple voices in batch"""
     try:
         results = []
-        upload_dir = Path("/app/temp/uploads")
-        upload_dir.mkdir(exist_ok=True, parents=True)
-        
-        for i, file in enumerate(files):
-            # Save uploaded file
-            file_path = upload_dir / f"{uuid.uuid4()}.wav"
-            with open(file_path, "wb") as f:
-                f.write(await file.read())
+        for idx, file in enumerate(files):
+            # Save file
+            temp_path = Path(f"/app/temp/{file.filename}")
+            with open(temp_path, "wb") as f:
+                content = await file.read()
+                f.write(content)
             
             # Clone voice
-            voice_name = f"{base_name}_{i+1}"
-            try:
-                voice_id = await voice_cloner.clone_voice(
-                    name=voice_name,
-                    description=f"Batch cloned voice {i+1}",
-                    audio_path=str(file_path),
-                    quality=quality
-                )
-                results.append({
-                    "success": True,
-                    "voice_id": voice_id,
-                    "name": voice_name,
-                    "original_filename": file.filename
-                })
-            except Exception as e:
-                results.append({
-                    "success": False,
-                    "error": str(e),
-                    "original_filename": file.filename
-                })
-            finally:
-                # Clean up temp file
-                file_path.unlink()
+            voice_name = f"{base_name}_{idx+1}"
+            voice_id = await advanced_voice_cloner.clone_voice(
+                audio_path=str(temp_path),
+                name=voice_name,
+                quality=quality
+            )
+            
+            results.append({
+                "filename": file.filename,
+                "voice_id": voice_id,
+                "voice_name": voice_name
+            })
+            
+            # Clean up
+            temp_path.unlink()
         
         return {
             "success": True,
             "results": results,
-            "total_processed": len(files)
+            "total_cloned": len(results)
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -342,7 +336,7 @@ async def batch_clone_voices(
 async def get_synthesis_history(limit: int = 100):
     """Get synthesis history"""
     try:
-        history = db_handler.get_synthesis_history(limit)
+        history = db_handler.get_history(limit=limit)
         return {
             "success": True,
             "history": history,
@@ -358,173 +352,131 @@ async def enhance_audio(
     normalize: bool = Form(True),
     remove_silence: bool = Form(False)
 ):
-    """Enhance uploaded audio"""
+    """Enhance audio quality"""
     try:
         # Save uploaded file
-        upload_dir = Path("/app/temp/uploads")
-        upload_dir.mkdir(exist_ok=True, parents=True)
+        temp_path = Path(f"/app/temp/{audio_file.filename}")
+        with open(temp_path, "wb") as f:
+            content = await audio_file.read()
+            f.write(content)
         
-        file_path = upload_dir / f"{uuid.uuid4()}.wav"
-        with open(file_path, "wb") as f:
-            f.write(await audio_file.read())
-        
-        # Enhance audio
+        # Process audio
         enhanced_path = audio_processor.enhance_audio(
-            audio_path=str(file_path),
+            audio_path=str(temp_path),
             denoise=denoise,
             normalize=normalize,
             remove_silence=remove_silence
         )
         
-        # Create download link
-        download_id = str(uuid.uuid4())
-        download_path = downloads_dir / f"{download_id}.wav"
-        shutil.copy(enhanced_path, download_path)
+        # Clean up
+        temp_path.unlink()
         
-        # Clean up temp files
-        file_path.unlink()
-        if enhanced_path != str(file_path):
-            Path(enhanced_path).unlink()
+        # Create download link
+        request_id = str(uuid.uuid4())
+        download_path = downloads_dir / f"{request_id}_enhanced.wav"
+        shutil.copy(enhanced_path, download_path)
         
         return {
             "success": True,
-            "download_url": f"/api/download/{download_id}",
-            "original_filename": audio_file.filename
+            "download_url": f"/api/download/{request_id}_enhanced",
+            "original_duration": audio_processor.get_duration(temp_path),
+            "enhanced_duration": audio_processor.get_duration(enhanced_path)
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.websocket("/ws/tts-stream")
 async def websocket_tts_stream(websocket):
-    """WebSocket endpoint for streaming TTS"""
+    """WebSocket endpoint for real-time TTS streaming"""
     await websocket.accept()
     try:
         while True:
-            # Receive text from client
+            # Receive text
             data = await websocket.receive_json()
-            text = data.get("text", "")
             
-            if not text:
-                continue
-            
-            # Generate speech
-            audio_path = await tts_handler.synthesize(
-                text=text,
-                stream=True
-            )
-            
-            # Read audio file and send chunks
-            with open(audio_path, "rb") as f:
-                while True:
-                    chunk = f.read(1024)
-                    if not chunk:
-                        break
-                    await websocket.send_bytes(chunk)
-            
-            # Send end marker
-            await websocket.send_json({"status": "complete"})
-            
+            # Stream TTS
+            async for chunk in tts_handler.stream_synthesis(
+                text=data.get("text", ""),
+                model_name=data.get("model_name"),
+                speaker=data.get("speaker"),
+                language=data.get("language", "en")
+            ):
+                await websocket.send_bytes(chunk)
     except Exception as e:
         logger.error(f"WebSocket error: {str(e)}")
+    finally:
         await websocket.close()
 
+# Create and mount Gradio interface
+gradio_app = create_gradio_interface(
+    tts_handler=tts_handler,
+    voice_cloner=voice_cloner,
+    advanced_voice_cloner=advanced_voice_cloner,
+    model_manager=model_manager,
+    audio_processor=audio_processor
+)
+
+# Mount Gradio app at root
+app = gr.mount_gradio_app(app, gradio_app, path="/")
+
+# API documentation
 @app.get("/api/docs")
 async def api_documentation():
     """Get API documentation"""
     return {
-        "title": "Coqui TTS WebGUI API",
-        "version": "2.0.0",
-        "description": "Advanced TTS Web Interface with Voice Cloning",
         "endpoints": {
-            "POST /api/tts": "Generate speech from text",
-            "GET /api/models": "List available TTS models",
-            "POST /api/models/download": "Download new TTS model",
-            "GET /api/models/{model_name}/info": "Get model information",
-            "POST /api/voices/clone": "Clone voice from audio",
-            "GET /api/voices": "List cloned voices",
-            "DELETE /api/voices/{voice_id}": "Delete cloned voice",
-            "POST /api/voices/batch-clone": "Clone multiple voices",
-            "GET /api/history": "Get synthesis history",
-            "POST /api/audio/enhance": "Enhance audio quality",
-            "GET /api/download/{request_id}": "Download generated audio",
-            "WS /ws/tts-stream": "Streaming TTS WebSocket"
+            "tts": {
+                "POST /api/tts": "Generate speech from text",
+                "GET /api/download/{request_id}": "Download synthesized audio"
+            },
+            "models": {
+                "GET /api/models": "List all available models",
+                "POST /api/models/download": "Download a new model",
+                "GET /api/models/{model_name}/info": "Get model information"
+            },
+            "voices": {
+                "POST /api/voices/clone": "Clone a voice from audio",
+                "GET /api/voices": "List all cloned voices",
+                "DELETE /api/voices/{voice_id}": "Delete a cloned voice",
+                "POST /api/voices/batch-clone": "Clone multiple voices"
+            },
+            "audio": {
+                "POST /api/audio/enhance": "Enhance audio quality"
+            },
+            "history": {
+                "GET /api/history": "Get synthesis history"
+            },
+            "websocket": {
+                "WS /ws/tts-stream": "Real-time TTS streaming"
+            }
         }
     }
 
-def create_gradio_app():
-    """Create Gradio interface"""
-    return create_gradio_interface(
-        tts_handler=tts_handler,
-        voice_cloner=voice_cloner,
-        model_manager=model_manager,
-        audio_processor=audio_processor
-    )
-
-async def startup_event():
-    """Application startup event"""
-    logger.info("Starting Coqui TTS WebGUI...")
+# Main entry point
+if __name__ == "__main__":
+    # Get ports from environment - use 8080 for cloud deployment
+    web_port = int(os.getenv("PORT", os.getenv("WEB_PORT", "8080")))
+    
+    # Create necessary directories
+    for dir_name in ["models", "output", "voice_samples", "user_data", "config", "logs", "temp"]:
+        Path(f"/app/{dir_name}").mkdir(exist_ok=True, parents=True)
     
     # Initialize database
     db_handler.initialize()
     
     # Load default models
-    await model_manager.load_default_models()
+    logger.info("Loading default models...")
+    model_manager.load_default_models()
     
-    logger.info("Application started successfully")
-
-if __name__ == "__main__":
-    import threading
+    # Run the server
+    logger.info(f"Starting Coqui TTS WebGUI on port {web_port}")
+    logger.info(f"Web UI: http://localhost:{web_port}")
+    logger.info(f"API Docs: http://localhost:{web_port}/api/docs")
     
-    # Create Gradio app
-    gradio_app = create_gradio_app()
-    
-    # Mount Gradio app
-    app = gr.mount_gradio_app(app, gradio_app, path="/")
-    
-    # Start application
-    logger.info("Starting Coqui TTS Web Interface...")
-    logger.info("Web UI: http://localhost:2201")
-    logger.info("API: http://localhost:8080")
-    logger.info("TTS Server: http://localhost:5002")
-    
-    # Run startup event
-    asyncio.run(startup_event())
-    
-    # Start servers
-    def start_api_server():
-        uvicorn.run(
-            app,
-            host="0.0.0.0",
-            port=8080,
-            log_level="info"
-        )
-    
-    def start_tts_server():
-        uvicorn.run(
-            "modules.tts_handler:create_tts_server",
-            host="0.0.0.0",
-            port=5002,
-            log_level="info"
-        )
-    
-    def start_web_server():
-        uvicorn.run(
-            app,
-            host="0.0.0.0",
-            port=2201,
-            log_level="info"
-        )
-    
-    # Start servers in separate threads
-    api_thread = threading.Thread(target=start_api_server)
-    tts_thread = threading.Thread(target=start_tts_server)
-    web_thread = threading.Thread(target=start_web_server)
-    
-    api_thread.start()
-    tts_thread.start()
-    web_thread.start()
-    
-    # Wait for all threads
-    api_thread.join()
-    tts_thread.join()
-    web_thread.join()
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=web_port,
+        reload=False,
+        log_level="info"
+    )
