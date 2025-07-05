@@ -18,7 +18,7 @@ pyloudnorm
 numpy
 pandas
 requests
-python-dotenv 
+python-dotenv
 
 # Additional dependencies for audio processing
 resemblyzer
@@ -32,4 +32,3 @@ unidic-lite
 
 # System audio dependencies
 pyaudio
-portaudio19-dev
